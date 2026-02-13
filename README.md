@@ -130,6 +130,28 @@ log = get_log()
 log.process_start("3D_phase1", purpose="...", study="S2_3D_structure")
 ```
 
+## Full 3D Pipeline
+
+```
+Phase 1 (3D_phase1)    ← YOU ARE HERE
+  └─ Step 0: Frame extraction (FFmpeg)
+  └─ Step 1: Initial 3D processing (Metashape)
+
+Manual Step: Straighten and crop models in Metashape GUI
+
+Phase 2 (3D_phase2)
+  └─ Step 2: Automatic scaling (coded targets)
+  └─ [Manual: Fix FAIL models if needed]
+  └─ Step 3: Dual export + orthomosaics
+```
+
+### What's Next
+
+After Phase 1 completes:
+
+1. **Manual Step**: Open each PSX file in `$PROJECT_DIR/processing/psxraw/` with Metashape GUI. Straighten, crop, and verify coded targets are visible (see Manual Step section above).
+2. **Phase 2**: Run `3D_phase2` on the same PROJECT_DIR for automatic scaling, model export (hi-poly + lo-poly), and orthomosaic generation.
+
 ## Changelog
 
 - v0.1.0 (2026-02-13): Initial version — split from 3D_vicarius
