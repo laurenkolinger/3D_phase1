@@ -1,0 +1,145 @@
+# ==============================================================================
+# MODULE INTERFACE DEFINITION
+# ==============================================================================
+# 3D_phase1 - Setup + Frame Extraction + Initial 3D Processing
+# ==============================================================================
+
+name: "3D_phase1"
+version: "0.1.0"
+description: "Phase 1 of 3D photogrammetry pipeline: setup, frame extraction, and initial Metashape processing"
+author: "Lauren K Olinger"
+created: "2026-02-13"
+
+type: "process"
+
+# ------------------------------------------------------------------------------
+# INPUTS
+# ------------------------------------------------------------------------------
+inputs:
+  - name: "video_files"
+    type: "directory"
+    formats: [".mov", ".mp4", ".mkv", ".avi"]
+    location: "raw/tcrmp_video/ or user-specified"
+    required: false
+    description: "Directory containing video files for frame extraction (runs step0 + step1)"
+
+  - name: "frame_directories"
+    type: "directory"
+    formats: [".jpg", ".jpeg", ".tiff", ".tif", ".png"]
+    location: "user-specified"
+    required: false
+    description: "Directory containing subdirectories of pre-extracted frames (runs step1 only)"
+
+# ------------------------------------------------------------------------------
+# OUTPUTS
+# ------------------------------------------------------------------------------
+outputs:
+  - name: "psx_files"
+    type: "file"
+    format: ".psx"
+    location: "$PROJECT_DIR/processing/psxraw/"
+    naming_pattern: "psx_{N}_{PROJECT_NAME}.psx"
+    description: "Metashape project files with initial 3D models"
+
+  - name: "extracted_frames"
+    type: "directory"
+    format: ".tiff"
+    location: "$PROJECT_DIR/processing/frames/{MODEL_ID}/"
+    naming_pattern: "{MODEL_ID}_{NNNNN}.tiff"
+    description: "Extracted video frames (16-bit TIFF)"
+
+  - name: "tracking_csv"
+    type: "file"
+    format: ".csv"
+    location: "$PROJECT_DIR/status_{PROJECT_NAME}.csv"
+    description: "Processing status tracking for all models"
+
+  - name: "step1_reports"
+    type: "file"
+    format: ".pdf"
+    location: "$PROJECT_DIR/processing/reportsraw/"
+    naming_pattern: "{MODEL_ID}_step1.pdf"
+    description: "Metashape processing reports from step 1"
+
+# ------------------------------------------------------------------------------
+# PARAMETERS
+# ------------------------------------------------------------------------------
+parameters:
+  - name: "frames_per_transect"
+    type: "integer"
+    default: 1000
+    description: "Number of frames to extract per video/transect"
+
+  - name: "chunk_size"
+    type: "integer"
+    default: 1000
+    description: "Maximum frames per Metashape chunk"
+
+  - name: "max_chunks_per_psx"
+    type: "integer"
+    default: 4
+    description: "Maximum chunks per PSX file for batch processing"
+
+  - name: "use_gpu"
+    type: "boolean"
+    default: true
+    description: "Enable GPU acceleration for Metashape processing"
+
+# ------------------------------------------------------------------------------
+# RUNTIME REQUIREMENTS
+# ------------------------------------------------------------------------------
+runtime:
+  python_version: "3.9"
+  gpu_required: true
+  external_software:
+    - name: "Agisoft Metashape Pro"
+      version: ">=2.1.1"
+    - name: "FFmpeg"
+      version: "any"
+  tested_os:
+    - "Ubuntu 22.04"
+    - "Ubuntu 24.04"
+  dependencies: "requirements.txt"
+  estimated_time: "2-24 hours depending on number and size of models"
+
+# ------------------------------------------------------------------------------
+# CLI INTERFACE
+# ------------------------------------------------------------------------------
+# This module is interactive and handles its own I/O prompts.
+# It does NOT follow the standard <input_file> <output_directory> pattern.
+cli:
+  main_script: "src/run_phase1.py"
+  interactive: true
+
+# ------------------------------------------------------------------------------
+# NAMING CONVENTIONS
+# ------------------------------------------------------------------------------
+# Input naming pattern: {PROJECTTYPE}{YYYYMMDD}_3D_{SITE}_{REPLICATE}[_n][_PROXY]
+# PROJECTTYPE: RBTEST, RBMAPPING, HYDRUSTEST, HYDRUSMAPPING, HYDRUSTCRMP, TCRMP, MISC
+# SITE: 3-letter codes (BWR, FLC, etc.) or other identifiers (DOCK)
+# REPLICATE: T1-Tn, TRY1-TRYn, RUN1-RUNn
+# _n: multipart video suffix (combined into single model)
+# _PROXY: encoding byproduct, stripped automatically
+
+# ------------------------------------------------------------------------------
+# RELATED STUDIES
+# ------------------------------------------------------------------------------
+studies:
+  - "S2_3D_structure"
+
+# ------------------------------------------------------------------------------
+# NOTES
+# ------------------------------------------------------------------------------
+notes: |
+  Phase 1 of the 3D photogrammetry pipeline. Handles:
+  - Video frame extraction (step 0) using FFmpeg with hardware acceleration
+  - Initial 3D reconstruction (step 1) using Agisoft Metashape API
+
+  After Phase 1, the user must manually straighten and crop models in
+  the Metashape GUI before running Phase 2 (automatic scaling and export).
+
+  This module wraps the first half of the 3D_vicarius pipeline
+  (github.com/laurenkolinger/3D_vicarius) into the VICARIUS module system.
+
+  Step 0 runs with system Python 3.9 + FFmpeg.
+  Step 1 runs via Metashape's bundled Python interpreter.

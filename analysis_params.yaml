@@ -1,0 +1,166 @@
+# TCRMP 3D Analysis Parameters
+# Edit this file to configure your analysis
+
+# Project Information
+project:
+  name: "base run" # This name will be overridden by the directory name
+  notes: "base run" 
+
+# Processing Parameters  
+
+processing:
+  # Frame Extraction (step0.py)
+  frames_per_transect: 1000 # Number of frames to extract per model (1200)
+  # extraction_rate: 0.5    # 1.0 = all frames, 0.5 = every other frame
+                            # Rate for extracting frames if frames_per_transect is 0.
+                            # Determines the interval: 1.0 = every frame, 0.5 = every 2nd frame, 0.25 = every 4th frame etc.
+                            # Ignored if frames_per_transect > 0 (linspace used instead).
+  
+  # Initial 3D Processing (step1.py)
+  chunk_size: 1000  # Maximum number of frames per chunk (1200)
+  use_gpu: true    # Whether to use GPU for processing
+  max_chunks_per_psx: 4    # Maximum number of chunks per PSX file for batch processing
+  metashape:
+    defaults:
+      # Point filtering thresholds
+      reconstruction_uncertainty: 50  # Maximum allowable reconstruction uncertainty value (lower is better)
+      reprojection_error: 1           # Maximum allowable reprojection error in pixels (lower is better) 
+      projection_accuracy: 10         # Maximum allowable projection accuracy value (lower is better)
+      
+      # Photo matching parameters
+      keypoint_limit: 40000           # Maximum number of keypoints per image
+      tiepoint_limit: 4000            # Maximum number of tie points per image pair
+      downscale: 1                    # Downscale factor for photos (1=highest quality, no downscaling)
+      generic_preselection: false      # Use image content for pre-selecting image pairs
+      reference_preselection: false   # Use image metadata for pre-selecting image pairs  
+      filter_stationary_points: false # Filter stationary points that don't contribute to the geometry
+      
+      # Camera optimization
+      fit_k4: true                    # Fit 4th radial distortion coefficient
+      adaptive_fitting: true          # Adaptively fit camera parameters based on estimated reliability
+      
+      # Depth map parameters
+      depth_downscale: 1             # Downscale factor for depth maps (1= no downscale, 4=medium quality) (1)
+      depth_filter_mode: "MildFiltering" # Depth map filtering mode: NoFiltering, MildFiltering, ModerateFiltering, AggressiveFiltering
+      
+      # Model building parameters
+      surface_type: "Arbitrary"        # Surface type: Arbitrary (freeform) or HeightField (flat surface)
+      interpolation: "EnabledInterpolation" # Interpolation mode: DisabledInterpolation, EnabledInterpolation, Extrapolated
+      face_count: "HighFaceCount"      # Target face count: LowFaceCount, MediumFaceCount, HighFaceCount, CustomFaceCount (MediumFaceCount)
+      volumetric_masks: false          # Use volumetric masking
+      vertex_colors: false              # Calculate vertex colors
+      
+      # Model smoothing
+      smooth_strength: 1               # Smoothing strength (1-10, higher=smoother)
+      fix_borders: true                # Fix model borders during smoothing
+      preserve_edges: false            # Preserve sharp edges during smoothing
+      
+      # UV mapping
+      mapping_mode: "GenericMapping"   # UV mapping mode: GenericMapping, OrthophotoMapping, AdaptiveOrthophotoMapping, SphericalMapping, CameraMapping
+      texture_size: 16384          # Texture size in pixels (power of 2) (16384 = 128^2 ; 4096 = 64^2 ; 4096 = 32^2 ; 2048 = 16^2 ; 1024 = 8^2 ; 512 = 4^2 ; 256 = 2^2 ; 128 = 1^2) (16384)
+      page_count: 1                    # Number of texture pages (4)
+      
+      # Texture building
+      texture_type: "DiffuseMap"       # Texture type: DiffuseMap, NormalMap, OcclusionMap
+      blending_mode: "MosaicBlending"  # Blending mode: AverageBlending, MosaicBlending, MaxBlending, MinBlending, DisabledBlending
+      fill_holes: true                 # Fill texture holes
+      ghosting_filter: true            # Filter ghosting artifacts
+      enable_texture_gpu: false        # Use GPU for texture generation (separate from main GPU setting)
+
+  # DEPRECATED - Chunk mgmt step 2 (useless) 
+  chunk_management:
+   psx_startdir: "examples/"         # Starting directory for PSX files
+   psx_finaldir: "examples/"        # Final directory for PSX files
+   chunk_quality:
+   min_cameras: 0                 # Minimum number of aligned cameras for a quality chunk
+   min_alignment_percentage: 0    # Minimum percentage of aligned cameras for a quality chunk
+  
+  # Model Processing (step2.py and step3.py)
+  model_processing:
+    has_coded_scales: true           # Whether the model has coded scale markers
+    scale_bars:                       # Scale bar definitions for automatic scaling
+      - start_marker: "target 1000"   # First marker label
+        end_marker: "target 1010"     # Second marker label
+        distance: 0.75                # Distance between markers in meters
+      - start_marker: "target 1020"
+        end_marker: "target 1030"
+        distance: 0.75
+    
+    scale_error_threshold: 0.05       # Maximum acceptable scale error in meters
+                                      # GENEROUS (50mm) for initial testing
+                                      # Conservative: 0.005m (5mm)
+                                      # Typical: 0.009m (9mm) - recommended after testing
+                                      # Relaxed: 0.01m (10mm)
+    
+    remove_unlisted_markers: true     # Remove all markers except those in scale_bars list
+                                      # Prevents clutter from extra detected targets
+    
+    enable_orthomosaic_gpu: true      # Use GPU for orthomosaic generation  
+    
+    decimation_factor: 10             # Divide mesh face count by this value for low-poly model
+                                      # 10 = reduce to 10% (e.g., 2,000,000 faces → 200,000 faces)
+    
+    camera_overlap_reduction:
+      target_overlap: 3               # Target number of cameras observing each surface point
+                                      # 3 = conservative (recommended first run)
+                                      # 2 = more aggressive removal
+    
+    ortho_tile_size: 1              # Tile size in meters (0.5m x 0.5m blocks)
+                                      # Converted to pixels based on resolution
+    orthomosaic:
+      resolution: 0                   # Resolution in meters/pixel (0 = native/auto from source images) Set to specific value like 0.001 for 1mm if you want fixed resolution
+      blending_mode: "MosaicBlending" # Blending mode for orthomosaic
+      fill_holes: true                # Fill holes in orthomosaic
+      ghosting_filter: false          # Enable ghosting filter (API default: false)
+      cull_faces: false               # Enable back-face culling (API default: false)
+      refine_seamlines: false         # Refine seamlines based on image content (API default: false)
+      subdivide_task: true            # Enable fine-level task subdivision (API default: true)
+      workitem_size_cameras: 1000     # Number of cameras per workitem (API default: 20)
+                                      # Higher = process more cameras at once (set to your camera count)
+      workitem_size_tiles: 10         # Number of tiles per workitem (API default: 10)
+      max_workgroup_size: 100         # Maximum workgroup size (API default: 100)
+      save_alpha: true                # Save alpha channel
+      save_world: true                # Save world file
+      compression: "LZW"              # Compression type: None, LZW, JPEG, Packbits
+      export_resolution: 0.0005       # resolution of export 
+      ortho_tile_size: 1              # size of ortho tiles (in m) 
+ 
+    model_export:
+      format: "OBJ"                   # Model format: OBJ, 3DS, FBX, etc.
+      texture_format: "TIFF"          # Texture format: TIFF (high quality), JPEG, PNG
+      save_texture: true              # Save textures with model
+      save_uv: true                   # Save UV coordinates
+      save_normals: true              # Save normal vectors
+      save_colors: true               # Save vertex colors
+  
+  # Final Exports and Web Publishing (step4.py)
+  # DEPRECATED: Step 4 is no longer used. Step 3 produces final outputs.
+  final_exports:
+    decimate_vertices: 3000000        # Number of vertices for decimated model (for web)
+    sketchfab:
+      token: "152b6186db06477482e2b42b327541da"  # Sketchfab API token
+      title_template: "Model: {chunk_label}"     # Template for model title
+      description: "generated using Metashape."   # Model description
+      tags: "3D, model, Metashape, coralreef"     # Tags for model
+      is_draft: true                  # Whether to publish as draft
+      is_private: false               # Whether model is private
+    final_orthomosaic:
+      resolution: 0.0005              # Final orthomosaic resolution (0.5mm)
+      save_alpha: true                # Save alpha channel
+      save_world: true                # Save world file
+      save_xyz: true                  # Save XYZ coordinate file
+    final_model:
+      texture_format: "JPEG"          # Texture format
+      texture_size: 4096              # Texture size
+      save_texture: true              # Save textures
+      save_uv: true                   # Save UV coordinates
+      save_normals: true              # Save normals
+      save_colors: true               # Save vertex colors
+    point_cloud:
+      format: "LAS"                   # Point cloud format
+      save_colors: true               # Save point colors
+      save_normals: true              # Save point normals
+  
+  # File Naming
+  psx_filename: "TCRMP{date}_3D_{site}"  # Template for final PSX files in output/psx/ 
+  
