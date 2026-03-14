@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import os
 import shutil
 import subprocess
@@ -57,6 +58,56 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".tiff", ".tif", ".png"}
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def fast_copy_file(src: Path, dst: Path) -> None:
+    """Copy a file using rsync (with progress) or fall back to cp.
+
+    rsync is typically faster than shutil.copy2 for large files and
+    supports resume on interruption.
+
+    Args:
+        src: Source file path.
+        dst: Destination file path.
+    """
+    rsync = shutil.which("rsync")
+    if rsync:
+        subprocess.run(
+            [rsync, "-ah", "--progress", "--partial", str(src), str(dst)],
+            check=True,
+        )
+    else:
+        # Fall back to cp which is still faster than shutil for large files
+        subprocess.run(["cp", "--preserve=timestamps", str(src), str(dst)], check=True)
+
+
+def parallel_copy_files(file_pairs: list, max_workers: int = 4) -> None:
+    """Copy multiple files in parallel using fast_copy_file.
+
+    Args:
+        file_pairs: List of (src_path, dst_path) tuples.
+        max_workers: Maximum concurrent copy operations.
+    """
+    if len(file_pairs) == 1:
+        src, dst = file_pairs[0]
+        print(f"    Copying {src.name}...")
+        fast_copy_file(src, dst)
+        return
+
+    workers = min(max_workers, len(file_pairs))
+    print(f"    Copying {len(file_pairs)} files ({workers} parallel workers)...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {}
+        for src, dst in file_pairs:
+            futures[executor.submit(fast_copy_file, src, dst)] = src.name
+        for future in concurrent.futures.as_completed(futures):
+            name = futures[future]
+            try:
+                future.result()
+                print(f"    Copied {name}")
+            except Exception as exc:
+                print(f"    ERROR copying {name}: {exc}")
+                raise
 
 
 def banner(text: str) -> None:
@@ -214,33 +265,21 @@ def create_venv(project_dir: Path) -> None:
         print("  Virtual environment already exists, skipping creation.")
         return
 
-    # Try Metashape's bundled Python 3.9 first
-    metashape_python = Path(
-        "/home/bizon/applications/metashape-pro_2_2_2_amd64/"
-        "metashape-pro/python/bin/python3.9"
-    )
-    if not metashape_python.exists():
-        metashape_python = shutil.which("python3.9")
-        if not metashape_python:
-            raise RuntimeError(
-                "Python 3.9 not found. Required for Metashape compatibility.\n"
-                "Expected at: /home/bizon/applications/metashape-pro_2_2_2_amd64/"
-                "metashape-pro/python/bin/python3.9"
-            )
-        metashape_python = Path(metashape_python)
+    python39 = shutil.which("python3.9")
+    if not python39:
+        raise RuntimeError(
+            "python3.9 not found on PATH.\n"
+            "Install with: sudo apt install python3.9 python3.9-venv python3.9-dev"
+        )
 
-    print(f"  Creating venv with {metashape_python}...")
-    subprocess.run(
-        [str(metashape_python), "-m", "venv", str(venv_dir)],
-        check=True,
-    )
+    print(f"  Creating venv with {python39}...")
+    subprocess.run([python39, "-m", "venv", str(venv_dir)], check=True)
+
+    requirements_file = GITHUB_REPO_DIR / "requirements.txt"
+    pip = venv_dir / "bin" / "pip"
 
     print("  Installing requirements...")
-    pip = venv_dir / "bin" / "pip"
-    subprocess.run(
-        [str(pip), "install", "-r", str(GITHUB_REPO_DIR / "requirements.txt")],
-        check=True,
-    )
+    subprocess.run([str(pip), "install", "-r", str(requirements_file)], check=True)
 
 
 def setup_project(
@@ -249,8 +288,18 @@ def setup_project(
     input_type: str,
     model_groups: dict,
     copy_frames: bool = False,
+    copy_videos: bool = False,
 ) -> None:
-    """Create project directory structure and populate with inputs."""
+    """Create project directory structure and populate with inputs.
+
+    Args:
+        project_dir: Root project directory to create.
+        input_path: Path containing source videos or frame directories.
+        input_type: Either 'video' or 'frames'.
+        model_groups: Dict from validate_and_group().
+        copy_frames: If True, copy frame dirs instead of symlinking.
+        copy_videos: If True, copy videos instead of symlinking.
+    """
     banner("PROJECT SETUP")
 
     # Create directories
@@ -272,20 +321,37 @@ def setup_project(
 
     # Copy or link input files
     if input_type == "video":
-        print("  Copying video files to video_source/...")
         video_source = project_dir / "video_source"
-        for base_id, parts in model_groups.items():
-            for part_info in parts:
-                src_file = input_path / part_info["original_name"]
-                if src_file.exists():
-                    dst_file = video_source / part_info["original_name"]
-                    if not dst_file.exists():
-                        print(f"    Copying {part_info['original_name']}...")
-                        shutil.copy2(str(src_file), str(dst_file))
+        if copy_videos:
+            print("  Copying video files to video_source/ (rsync)...")
+            copy_pairs = []
+            for base_id, parts in model_groups.items():
+                for part_info in parts:
+                    src_file = input_path / part_info["original_name"]
+                    if src_file.exists():
+                        dst_file = video_source / part_info["original_name"]
+                        if not dst_file.exists():
+                            copy_pairs.append((src_file, dst_file))
+                        else:
+                            print(f"    {part_info['original_name']} already exists, skipping.")
                     else:
-                        print(f"    {part_info['original_name']} already exists, skipping.")
-                else:
-                    print(f"    WARNING: {src_file} not found, skipping.")
+                        print(f"    WARNING: {src_file} not found, skipping.")
+            if copy_pairs:
+                parallel_copy_files(copy_pairs)
+        else:
+            print("  Symlinking video files to video_source/...")
+            for base_id, parts in model_groups.items():
+                for part_info in parts:
+                    src_file = input_path / part_info["original_name"]
+                    if src_file.exists():
+                        dst_file = video_source / part_info["original_name"]
+                        if not dst_file.exists():
+                            print(f"    Linking {part_info['original_name']}...")
+                            os.symlink(str(src_file.resolve()), str(dst_file))
+                        else:
+                            print(f"    {part_info['original_name']} already exists, skipping.")
+                    else:
+                        print(f"    WARNING: {src_file} not found, skipping.")
     else:
         frames_dir = project_dir / "processing" / "frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
@@ -435,9 +501,10 @@ def main():
         "--project", "-p", type=Path, help="Project directory path"
     )
     parser.add_argument(
-        "--copy-frames",
+        "--copy-videos",
         action="store_true",
-        help="Copy frames instead of symlinking (default: symlink)",
+        help="Copy videos instead of symlinking (default: symlink). "
+        "Uses rsync with parallel workers for faster transfers.",
     )
     parser.add_argument(
         "--skip-vim",
@@ -475,6 +542,22 @@ def main():
     else:
         print("  Will run: Step 1 (3D processing) [skipping Step 0]")
 
+    # ---- Ask about video transfer mode (interactive only) ----
+    # Frames are always copied to maintain consistent filesystem structure.
+    copy_videos = args.copy_videos
+    copy_frames = True
+    if input_type == "video" and not args.copy_videos:
+        print()
+        print("  Video transfer mode:")
+        print("    1. Symlink (default) - instant, videos stay in original location")
+        print("    2. Copy - slower, but needed if source will be disconnected")
+        transfer = input("  Choose [1/2]: ").strip()
+        if transfer == "2":
+            copy_videos = True
+            print("  Will copy videos (rsync, parallel).")
+        else:
+            print("  Will symlink videos.")
+
     # ---- Validate names ----
     print("\nValidating naming conventions...")
     names = collect_input_names(input_path, input_type)
@@ -487,17 +570,16 @@ def main():
         else:
             print(f"    {base_id}")
 
-    # ---- VICARIUS: Purpose and study (Commandment VI) ----
+    # ---- VICARIUS: Purpose (Commandment VI) ----
     banner("PURPOSE (Commandment VI)")
     purpose = input("  Why are you running this? ").strip()
     if not purpose:
         purpose = "3D Phase 1 processing"
-    study = input("  Associated study (e.g., S2_3D_structure) [blank=none]: ").strip()
 
     # ---- Create VICARIUS run ----
     vicarius_run_dir = None
     try:
-        vicarius_run_dir = create_vicarius_run(purpose, study)
+        vicarius_run_dir = create_vicarius_run(purpose, "")
         print(f"\n  VICARIUS run created: {vicarius_run_dir.name}")
     except Exception as e:
         print(f"\n  Warning: Could not create VICARIUS run: {e}")
@@ -511,21 +593,24 @@ def main():
             start_event = log.process_start(
                 module="3D_phase1",
                 purpose=purpose,
-                study=study if study else None,
                 inputs=[str(input_path)],
             )
         except Exception as e:
             print(f"  Warning: VICARIUS logging failed: {e}")
 
     # ---- Confirmation ----
+    if input_type == "video":
+        transfer_mode = "copy (rsync)" if copy_videos else "symlink"
+    else:
+        transfer_mode = "copy" if copy_frames else "symlink"
+
     banner("SUMMARY")
     print(f"  Input:       {input_path}")
     print(f"  Input type:  {input_type}")
+    print(f"  Transfer:    {transfer_mode}")
     print(f"  Models:      {len(model_groups)}")
     print(f"  Project dir: {project_dir}")
     print(f"  Purpose:     {purpose}")
-    if study:
-        print(f"  Study:       {study}")
     print()
     confirm = input("  Proceed? (y/n): ").strip().lower()
     if confirm != "y":
@@ -534,7 +619,11 @@ def main():
 
     # ---- Setup project ----
     try:
-        setup_project(project_dir, input_path, input_type, model_groups, args.copy_frames)
+        setup_project(
+            project_dir, input_path, input_type, model_groups,
+            copy_frames=copy_frames,
+            copy_videos=copy_videos,
+        )
     except Exception as e:
         print(f"\nError during project setup: {e}")
         sys.exit(1)

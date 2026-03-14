@@ -69,7 +69,10 @@ def extract_frames_ffmpeg(video_path, output_dir, frames_per_transect, video_nam
     
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
-    
+
+    # Snapshot existing files so we only count newly extracted ones
+    existing_files = set(os.listdir(output_dir))
+
     # Calculate fps value for the extraction
     if frames_per_transect <= 0:
         raise ValueError(f"frames_per_transect must be > 0. Found {frames_per_transect}")
@@ -147,13 +150,13 @@ def extract_frames_ffmpeg(video_path, output_dir, frames_per_transect, video_nam
         if process.returncode != 0:
             raise subprocess.CalledProcessError(process.returncode, ffmpeg_cmd)
         
-        # Get list of extracted frames
+        # Get list of newly extracted frames (exclude pre-existing files)
         extracted_frame_paths = sorted([
-            os.path.join(output_dir, f) for f in os.listdir(output_dir) 
-            if f.endswith('.tiff')
+            os.path.join(output_dir, f) for f in os.listdir(output_dir)
+            if f.endswith('.tiff') and f not in existing_files
         ])
         frames_extracted = len(extracted_frame_paths)
-        
+
         # Check size of first frame
         if frames_extracted > 0:
             size_mb = os.path.getsize(extracted_frame_paths[0]) / (1024 * 1024)
@@ -180,16 +183,17 @@ def extract_frames_ffmpeg(video_path, output_dir, frames_per_transect, video_nam
             '-c:v', 'tiff',
             '-pix_fmt', 'rgb48le',
             '-compression_level', '0',
+            '-start_number', str(start_number),
             output_pattern
         ]
         
         try:
             subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
             
-            # Get list of extracted frames
+            # Get list of newly extracted frames (exclude pre-existing files)
             extracted_frame_paths = sorted([
-                os.path.join(output_dir, f) for f in os.listdir(output_dir) 
-                if f.endswith('.tiff')
+                os.path.join(output_dir, f) for f in os.listdir(output_dir)
+                if f.endswith('.tiff') and f not in existing_files
             ])
             frames_extracted = len(extracted_frame_paths)
             
