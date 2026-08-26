@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# VICARIUS module pre-push: push logging ONLY, never blocks.
+#
+# Thin shim installed into each ACTIVE module repo as .githooks/pre-push.
+# The real logic lives in the harness at .githooks/lib/modules-push-log.sh;
+# this file just finds and sources it. Blocking layers (schema drift, docs
+# freshness) stay harness-only by decision T20260521-182402 (2026-08-26).
+# This hook ALWAYS exits 0: a logging failure must never block a push.
+#
+# Install (from a module repo root, harness = /mnt/rip/vicarius_drive):
+#   mkdir -p .githooks
+#   cp <harness>/.githooks/lib/modules-pre-push .githooks/pre-push
+#   chmod +x .githooks/pre-push
+#   git config core.hooksPath .githooks
+
+lib=""
+if [ -n "${VICARIUS_ROOT:-}" ] && [ -f "${VICARIUS_ROOT}/.githooks/lib/modules-push-log.sh" ]; then
+    lib="${VICARIUS_ROOT}/.githooks/lib/modules-push-log.sh"
+else
+    p="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
+    while [ -n "${p}" ] && [ "${p}" != "/" ]; do
+        p="$(dirname "${p}")"
+        if [ -f "${p}/.githooks/lib/modules-push-log.sh" ]; then
+            lib="${p}/.githooks/lib/modules-push-log.sh"
+            break
+        fi
+    done
+fi
+
+if [ -n "${lib}" ]; then
+    # shellcheck source=/dev/null
+    . "${lib}"
+else
+    echo "[pre-push] harness push logger not found; push not logged (not blocked)" >&2
+fi
+exit 0
