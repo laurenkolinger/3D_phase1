@@ -52,6 +52,17 @@ METASHAPE_SEARCH_PATHS = [
     "/home/bizon/applications/metashape-pro_2_2_2_amd64/metashape-pro/metashape",
 ]
 
+# Cooperative-pause contract. A step (step0/step1) that sees the pause sentinel
+# exits with this code; we translate that into a PipelinePaused so main() can
+# stop the pipeline gracefully and propagate PAUSE_EXIT_CODE to the VICARIUS
+# runner (which records the run as "paused", not "failed"). Re-running resumes.
+PAUSE_EXIT_CODE = 42
+
+
+class PipelinePaused(Exception):
+    """Raised when a step exits because a pause was requested."""
+
+
 VIDEO_EXTENSIONS = {".mov", ".mp4", ".mkv", ".avi"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".tiff", ".tif", ".png"}
 
@@ -414,6 +425,8 @@ def run_step0(project_dir: Path) -> None:
 
     process = subprocess.run(cmd, cwd=str(GITHUB_REPO_DIR))
 
+    if process.returncode == PAUSE_EXIT_CODE:
+        raise PipelinePaused("Step 0 paused at a transect boundary")
     if process.returncode != 0:
         raise RuntimeError(f"Step 0 failed with return code {process.returncode}")
 
@@ -437,6 +450,8 @@ def run_step1(project_dir: Path, metashape_path: str) -> None:
 
     process = subprocess.run(cmd, env=env, cwd=str(GITHUB_REPO_DIR))
 
+    if process.returncode == PAUSE_EXIT_CODE:
+        raise PipelinePaused("Step 1 paused at a model boundary")
     if process.returncode != 0:
         raise RuntimeError(f"Step 1 failed with return code {process.returncode}")
 
@@ -511,6 +526,20 @@ def main():
         action="store_true",
         help="Skip opening analysis_params.yaml in vim",
     )
+    parser.add_argument(
+        "--purpose",
+        type=str,
+        default=None,
+        help="Run purpose (Commandment VI). When set, the interactive purpose "
+        "prompt is skipped — used by the VICARIUS UI which collects this in "
+        "the form.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the SUMMARY confirmation prompt. Used by the VICARIUS UI "
+        "to run non-interactively when all inputs come from the form.",
+    )
     args = parser.parse_args()
 
     start_time = time.time()
@@ -544,9 +573,11 @@ def main():
 
     # ---- Ask about video transfer mode (interactive only) ----
     # Frames are always copied to maintain consistent filesystem structure.
+    # In non-interactive mode (--yes), default to symlink (matches the
+    # historical "press 1 / Enter" default).
     copy_videos = args.copy_videos
     copy_frames = True
-    if input_type == "video" and not args.copy_videos:
+    if input_type == "video" and not args.copy_videos and not args.yes:
         print()
         print("  Video transfer mode:")
         print("    1. Symlink (default) - instant, videos stay in original location")
@@ -557,6 +588,8 @@ def main():
             print("  Will copy videos (rsync, parallel).")
         else:
             print("  Will symlink videos.")
+    elif input_type == "video" and args.yes and not args.copy_videos:
+        print("  Video transfer mode: symlink (--yes default; pass --copy-videos for rsync).")
 
     # ---- Validate names ----
     print("\nValidating naming conventions...")
@@ -572,7 +605,11 @@ def main():
 
     # ---- VICARIUS: Purpose (Commandment VI) ----
     banner("PURPOSE (Commandment VI)")
-    purpose = input("  Why are you running this? ").strip()
+    if args.purpose:
+        purpose = args.purpose.strip()
+        print(f"  Purpose (from --purpose): {purpose}")
+    else:
+        purpose = input("  Why are you running this? ").strip()
     if not purpose:
         purpose = "3D Phase 1 processing"
 
@@ -612,10 +649,13 @@ def main():
     print(f"  Project dir: {project_dir}")
     print(f"  Purpose:     {purpose}")
     print()
-    confirm = input("  Proceed? (y/n): ").strip().lower()
-    if confirm != "y":
-        print("Aborted.")
-        sys.exit(0)
+    if args.yes:
+        print("  Proceeding (--yes).")
+    else:
+        confirm = input("  Proceed? (y/n): ").strip().lower()
+        if confirm != "y":
+            print("Aborted.")
+            sys.exit(0)
 
     # ---- Setup project ----
     try:
@@ -648,6 +688,29 @@ def main():
             run_step0(project_dir)
 
         run_step1(project_dir, metashape_path)
+
+    except PipelinePaused as e:
+        banner("PHASE 1 PAUSED")
+        print()
+        print(f"  {e}")
+        print(
+            "  Re-run 3D_phase1 on the same project to resume "
+            "(extracted / reconstructed models are skipped)."
+        )
+        print()
+        if VICARIUS_LOGGING and start_event:
+            try:
+                log = get_log()
+                log.process_end(
+                    module="3D_phase1",
+                    status="paused",
+                    duration_sec=time.time() - start_time,
+                    parent_event_id=start_event,
+                    notes=str(e),
+                )
+            except Exception:
+                pass
+        sys.exit(PAUSE_EXIT_CODE)
 
     except RuntimeError as e:
         elapsed = time.time() - start_time

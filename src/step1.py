@@ -14,6 +14,9 @@ import pandas as pd
 import time
 import sys
 import traceback
+import fcntl
+import shutil
+import socket
 from config import (
     DIRECTORIES,
     PROJECT_NAME,
@@ -24,6 +27,11 @@ from config import (
     get_transect_status,
     TIMESTAMP
 )
+
+# Minimum free space on the temp volume (TMPDIR or /tmp) before we start.
+# Metashape spills depth_maps_pyramids here; running out mid-build is the
+# original FLC T6 failure mode (see _DOCS/archive/incidents/INCIDENT_2026-05_parallel_step1_flc_t6.md).
+MIN_TEMP_FREE_GB = int(os.environ.get("STEP1_MIN_TEMP_FREE_GB", "50"))
 
 # Print all directory paths for debugging
 print("DEBUG: Directory paths:")
@@ -63,6 +71,153 @@ logging.basicConfig(
 
 # Maximum number of chunks per PSX file
 MAX_CHUNKS_PER_PSX = PARAMS['processing'].get('max_chunks_per_psx', 5)
+
+# Cooperative-pause contract (shared across step1/step2/step3 + run_phaseN.py +
+# the VICARIUS runner). When the UI / queue requests a pause it drops a sentinel
+# file in the project root; we check it only at safe model/batch boundaries
+# (after the tracking CSV is updated and the PSX is saved), finish nothing
+# mid-flight, and exit with PAUSE_EXIT_CODE so the orchestrator knows this was a
+# clean pause (not a failure). Re-running the module resumes: completed models
+# are skipped (idempotent). The exclusive project lock is released automatically
+# when the process exits, so a paused run frees the GPU + the lock.
+PAUSE_EXIT_CODE = 42
+PAUSE_SENTINEL = ".pause_requested"
+
+
+def pause_requested():
+    """True when a pause sentinel file exists in the project root."""
+    return os.path.exists(os.path.join(DIRECTORIES["base"], PAUSE_SENTINEL))
+
+
+def checkpoint_pause(where, save_fn=None):
+    """At a safe boundary: if a pause was requested, persist + exit cleanly.
+
+    save_fn (optional) is called to flush in-memory document state to disk
+    BEFORE exiting, so the work matching the tracking CSV is durable. The
+    project lock (if held) is released by process exit.
+    """
+    if not pause_requested():
+        return
+    logging.info(f"PAUSE requested - stopping cleanly at boundary: {where}")
+    if save_fn is not None:
+        try:
+            save_fn()
+        except Exception as exc:  # pragma: no cover - best-effort flush
+            logging.warning(f"pause: save before exit failed: {exc}")
+    logging.info(
+        "Paused. Re-run this module on the same project to resume "
+        "(completed models are skipped)."
+    )
+    sys.exit(PAUSE_EXIT_CODE)
+
+
+def acquire_project_lock(step_name):
+    """Take an exclusive flock on <project>/.processing.lock.
+
+    Refuses to start if another step is already running for this project.
+    Caller must keep the returned file object alive — closing it releases
+    the lock. Stamps the file with PID, step name, hostname, and start time
+    so the holder is visible if a future run is blocked.
+    """
+    lock_path = os.path.join(DIRECTORIES["base"], ".processing.lock")
+    lock_fp = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_fp.close()
+        try:
+            with open(lock_path, "r") as f:
+                holder = f.read().strip() or "(unknown holder)"
+        except Exception:
+            holder = "(unknown holder)"
+        raise RuntimeError(
+            f"Another VICARIUS 3D step is already running for this project.\n"
+            f"  Lock file: {lock_path}\n"
+            f"  Held by:   {holder}\n"
+            f"  Refusing to launch {step_name}. If you are certain no other run is "
+            f"active, delete the lock file and retry."
+        )
+    stamp = (
+        f"pid={os.getpid()} step={step_name} "
+        f"host={socket.gethostname()} "
+        f"started={datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    )
+    lock_fp.write(stamp)
+    lock_fp.flush()
+    logging.info(f"Acquired project lock at {lock_path} ({stamp.strip()})")
+    return lock_fp
+
+
+def check_temp_free_space(min_gb=None):
+    """Refuse to start if TMPDIR (or /tmp) has less than min_gb free.
+
+    Metashape's depth_maps_pyramids intermediates land in TMPDIR. Running
+    out of space mid-build leaves a half-saved PSX (the original 2026-05
+    incident). This is a coarse preflight only — it does not guarantee
+    enough space for the full run, just that we are not starting empty.
+    """
+    if min_gb is None:
+        min_gb = MIN_TEMP_FREE_GB
+    tmpdir = os.environ.get("TMPDIR", "/tmp")
+    try:
+        free_bytes = shutil.disk_usage(tmpdir).free
+    except OSError as e:
+        raise RuntimeError(f"Cannot stat TMPDIR={tmpdir}: {e}")
+    free_gb = free_bytes / (1024 ** 3)
+    logging.info(f"Temp volume free space: {free_gb:.1f} GB at {tmpdir}")
+    if free_gb < min_gb:
+        raise RuntimeError(
+            f"Refusing to start: only {free_gb:.1f} GB free at {tmpdir}, "
+            f"need at least {min_gb} GB for Metashape intermediates. "
+            f"Free space or point TMPDIR at a larger volume "
+            f"(export TMPDIR=/path/with/space before launching)."
+        )
+
+
+def verify_psx_chunk(psx_path, transect_id):
+    """Open psx_path in a fresh Document and confirm the chunk is real.
+
+    Returns True only when a chunk with label==transect_id exists with a
+    built model AND at least one texture. Anything less means the save did
+    not actually land. We do this in a throwaway Document so the active
+    one is untouched.
+    """
+    if not os.path.exists(psx_path):
+        logging.error(f"Verify: PSX file does not exist: {psx_path}")
+        return False
+    try:
+        verify_doc = Metashape.Document()
+        try:
+            verify_doc.open(psx_path, read_only=True, ignore_lock=True)
+        except Exception as e:
+            logging.error(f"Verify: could not reopen {psx_path}: {e}")
+            return False
+        try:
+            chunks_by_label = {c.label: c for c in verify_doc.chunks}
+            chunk = chunks_by_label.get(transect_id)
+            if chunk is None:
+                logging.error(
+                    f"Verify: no chunk labeled {transect_id} in {psx_path}. "
+                    f"Found: {sorted(chunks_by_label.keys())}"
+                )
+                return False
+            if not chunk.model:
+                logging.error(f"Verify: chunk {transect_id} has no model in {psx_path}")
+                return False
+            if not chunk.model.textures:
+                logging.error(f"Verify: chunk {transect_id} has model but no textures in {psx_path}")
+                return False
+            logging.info(
+                f"Verify: {transect_id} confirmed in {psx_path} "
+                f"({len(chunk.model.faces)} faces, {len(chunk.model.textures)} texture(s))"
+            )
+            return True
+        finally:
+            verify_doc = None
+    except Exception as e:
+        logging.error(f"Verify: unexpected error checking {psx_path} for {transect_id}: {e}")
+        return False
+
 
 def enumerate_gpus():
     """
@@ -244,13 +399,15 @@ def process_transect(transect_id, chunk, doc, psx_path):
             subdivide_task=True  # Split into subtasks for better GPU utilization
         )
         
-        # Verify model exists
-        if chunk.model:
-            logging.info(f"Model built successfully with {len(chunk.model.faces)} faces.")
-        else:
-            logging.error(f"Model build step completed but chunk.model is None for {transect_id}!")
-            # Optionally raise an error here or just log and continue depending on desired behavior
-            # raise RuntimeError(f"Model build failed for {transect_id}")
+        # Verify model exists. We raise here (rather than just logging)
+        # because the old "log and continue" path let step 1 mark a chunk
+        # as complete with no usable mesh. See the 2026-05 FLC T6 incident.
+        if not chunk.model:
+            raise RuntimeError(
+                f"buildModel returned but chunk.model is None for {transect_id}. "
+                f"Treating as failed and refusing to advance."
+            )
+        logging.info(f"Model built successfully with {len(chunk.model.faces)} faces.")
         
         # Smooth model
         logging.info(f"Smoothing model for {transect_id}")
@@ -300,22 +457,26 @@ def process_transect(transect_id, chunk, doc, psx_path):
             Metashape.app.cpu_enable = saved_cpu_enable
             logging.info("GPU re-enabled after texture building")
         
-        # Verify texture exists
-        if chunk.model and chunk.model.textures:
-             logging.info(f"Texture built successfully with {len(chunk.model.textures)} texture(s).")
-        elif chunk.model:
-             logging.warning(f"Texture build step completed but chunk.model.textures is empty for {transect_id}!")
-        else: 
-             # Model didn't exist, so texture couldn't be built
-             logging.warning(f"Texture build skipped because model does not exist for {transect_id}.")
+        # Verify texture exists. Same reasoning as the model check above:
+        # a textureless chunk is not a usable Step 1 output. Raise rather
+        # than silently marking Step 1 complete.
+        if not chunk.model:
+            raise RuntimeError(f"Texture build skipped: model missing for {transect_id}")
+        if not chunk.model.textures:
+            raise RuntimeError(
+                f"buildTexture completed but chunk.model.textures is empty for {transect_id}"
+            )
+        logging.info(f"Texture built successfully with {len(chunk.model.textures)} texture(s).")
         
         end_time = datetime.datetime.now()
         processing_time = (end_time - start_time).total_seconds()
         
-        # Update tracking file
+        # Record the build-time facts now, but DO NOT mark Step 1 complete
+        # here — that flag flips only after the PSX save is verified on disk
+        # (see process_batch). The 2026-05 FLC T6 incident wrote complete=True
+        # before doc.save() landed, leaving an unrecoverable orphan chunk.
         update_tracking(transect_id, {
-            "Status": "Step 1 complete",
-            "Step 1 complete": "True",
+            "Status": "Step 1 build complete (awaiting save verification)",
             "Step 1 start time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
             "Step 1 end time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
             "Step 1 processing time (s)": str(processing_time),
@@ -374,12 +535,20 @@ def process_batch(transects, batch_num, timestamp):
     
     # Process each transect in the batch
     for i, transect_id in enumerate(transects):
+        # Pause boundary: stop before starting a new model. Prior models in
+        # this batch were already saved+verified per-transect below, so we
+        # flush the doc only if it actually holds processed chunks.
+        checkpoint_pause(
+            f"before model {transect_id} (batch {batch_num})",
+            save_fn=(lambda: doc.save(psx_path)) if results else None,
+        )
+
         # Skip if already processed
         status = get_transect_status(transect_id)
         if status.get("Step 1 complete", "False") == "True":
             logging.info(f"Model {transect_id} already processed, skipping...")
             continue
-        
+
         logging.info(f"Processing model {transect_id} ({i+1}/{len(transects)})")
         
         # Create a new chunk for this transect
@@ -392,28 +561,63 @@ def process_batch(transects, batch_num, timestamp):
             results[transect_id] = psx_path
             # Update tracking with the PSX path
             update_tracking(transect_id, {"PSX file": psx_path})
-            
+
             # Create report for this transect
             try:
                 # Use processing/reports_initial for step 1 reports
                 reports_initial_dir = os.path.join(DIRECTORIES["processing_root"], "reportsraw")
                 os.makedirs(reports_initial_dir, exist_ok=True)
-                
+
                 # Generate report
                 report_file_path = os.path.join(reports_initial_dir, f"{transect_id}_step1.pdf")
                 chunk.exportReport(report_file_path, title=f"Model {transect_id} - Step 1 Report")
-                
+
                 # Update tracking with report path
                 update_tracking(transect_id, {"Report file": report_file_path})
-                
+
                 logging.info(f"Report generated: {report_file_path}")
             except Exception as e:
                 logging.error(f"Error generating report for {transect_id}: {str(e)}")
-            
-        # Save the document after each transect
-        logging.info(f"Saving document to {psx_path} after processing {transect_id}")
-        Metashape.app.update() # Keep update BEFORE saving in process_batch
-        doc.save(psx_path)
+
+            # Save the document after this chunk, then re-open it in a
+            # throwaway Document to confirm the chunk landed with model +
+            # texture before flipping "Step 1 complete" to True. Without
+            # this gate, a doc.save() that fails mid-write (e.g. parallel
+            # process, full disk, crash) leaves a tracking row that says
+            # "complete" but points at unusable bytes.
+            logging.info(f"Saving document to {psx_path} after processing {transect_id}")
+            Metashape.app.update()
+            doc.save(psx_path)
+
+            if verify_psx_chunk(psx_path, transect_id):
+                update_tracking(transect_id, {
+                    "Status": "Step 1 complete",
+                    "Step 1 complete": "True",
+                })
+                logging.info(f"Step 1 verified for {transect_id} in {psx_path}")
+            else:
+                error_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                update_tracking(transect_id, {
+                    "Status": "Step 1 save verification failed",
+                    "Step 1 complete": "False",
+                    "Step 1 error time": error_time,
+                    "Notes": (
+                        f"doc.save returned but reopen could not find chunk "
+                        f"{transect_id} with model+texture in {psx_path}. "
+                        f"Treat as needs-rerun."
+                    ),
+                })
+                logging.error(
+                    f"Step 1 save verification FAILED for {transect_id} — "
+                    f"row left as Step 1 complete=False"
+                )
+        else:
+            # process_transect already marked the row as failed; just save
+            # the doc so any partial chunk artifacts are persisted for
+            # forensic inspection.
+            logging.info(f"Saving document to {psx_path} after FAILED processing of {transect_id}")
+            Metashape.app.update()
+            doc.save(psx_path)
     
     # Final save of the document
     logging.info(f"Final save of batch {batch_num} to {psx_path}")
@@ -427,30 +631,38 @@ def process_batch(transects, batch_num, timestamp):
 
 def main():
     """Process transects in completely isolated batches."""
+    # Preflight: confirm temp volume has room for Metashape intermediates,
+    # then take an exclusive project lock so a second step1/step2 cannot
+    # race against this one (the 2026-05 FLC T6 incident root cause).
+    # The lock_fp must stay open for the lifetime of main(); we bind it
+    # to a local so it is released on return / exception.
+    check_temp_free_space()
+    lock_fp = acquire_project_lock("step1")  # noqa: F841 -- holds the flock
+
     # Get list of transect directories with frames
     transect_dirs = []
     frames_dir = DIRECTORIES["frames"]
     if os.path.exists(frames_dir):
-        transect_dirs = [d for d in os.listdir(frames_dir) 
+        transect_dirs = [d for d in os.listdir(frames_dir)
                         if os.path.isdir(os.path.join(frames_dir, d))]
-    
+
     if not transect_dirs:
         logging.error(f"No model directories found in {frames_dir}")
         return
-    
+
     # Filter for unprocessed transects
     unprocessed_transects = []
     for transect_id in transect_dirs:
         status = get_transect_status(transect_id)
         if status.get("Step 1 complete", "False") != "True":
             unprocessed_transects.append(transect_id)
-    
+
     if not unprocessed_transects:
         logging.info("All models have already been processed")
         return
-    
+
     logging.info(f"Found {len(unprocessed_transects)} models to process")
-    
+
     # Process in completely isolated batches
     timestamp = datetime.datetime.now().strftime("%Y%m%d")
     
@@ -472,8 +684,13 @@ def main():
     
     for i, batch in enumerate(batches):
         batch_num = i + 1  # Start with batch 1
+
+        # Pause boundary: the previous batch's document is fully saved + closed
+        # here, so this is the cleanest place to stop. No open doc to flush.
+        checkpoint_pause(f"before batch {batch_num} of {len(batches)}")
+
         logging.info(f"Starting batch {batch_num} of {len(batches)}")
-        
+
         # Process the batch (completely isolated from other batches)
         batch_results = process_batch(batch, batch_num, timestamp)
         
@@ -483,8 +700,41 @@ def main():
         # Force garbage collection
         import gc
         gc.collect()
-    
+
+    # Post-batch sweep: walk the tracking CSV one more time and re-verify
+    # every row that claims Step 1 complete. This catches any drift between
+    # the CSV and the PSX files on disk (the 2026-05 FLC T6 mode).
+    logging.info("Running Step 1 completeness sweep against tracking CSV...")
+    sweep_failures = []
+    for transect_id in transect_dirs:
+        status = get_transect_status(transect_id)
+        if status.get("Step 1 complete", "False") != "True":
+            continue
+        psx_path = (status.get("PSX file") or "").strip()
+        if not psx_path:
+            sweep_failures.append((transect_id, "no PSX file recorded"))
+            continue
+        if not verify_psx_chunk(psx_path, transect_id):
+            sweep_failures.append((transect_id, f"verify failed for {psx_path}"))
+            update_tracking(transect_id, {
+                "Status": "Step 1 sweep failed",
+                "Step 1 complete": "False",
+                "Notes": (
+                    f"Post-batch sweep could not verify {transect_id} in "
+                    f"{psx_path}; row reset to needs-rerun."
+                ),
+            })
+    if sweep_failures:
+        logging.error(
+            f"Step 1 completeness sweep flagged {len(sweep_failures)} model(s); "
+            f"their tracking rows were reset:"
+        )
+        for tid, reason in sweep_failures:
+            logging.error(f"  {tid}: {reason}")
+    else:
+        logging.info("Step 1 completeness sweep: all complete rows verified on disk")
+
     logging.info("Step 1 isolated processing complete")
 
 if __name__ == "__main__":
-    main() 
+    main()

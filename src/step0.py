@@ -7,6 +7,7 @@ specified in analysis_params.yaml.
 """
 
 import os
+import sys
 import cv2
 import numpy as np
 from pathlib import Path
@@ -34,6 +35,32 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+# Cooperative-pause contract (see step1/step2/step3). A sentinel file in the
+# project root requests a pause; we honor it between transects (after the prior
+# transect's frames are extracted and the tracking CSV updated), then exit with
+# PAUSE_EXIT_CODE so the orchestrator treats it as a clean pause. Re-running
+# resumes (already-extracted transects are skipped by the per-transect status).
+PAUSE_EXIT_CODE = 42
+PAUSE_SENTINEL = ".pause_requested"
+
+
+def pause_requested():
+    """True when a pause sentinel file exists in the project root."""
+    return os.path.exists(os.path.join(DIRECTORIES["base"], PAUSE_SENTINEL))
+
+
+def checkpoint_pause(where):
+    """Between transects: if a pause was requested, exit cleanly (no open state)."""
+    if not pause_requested():
+        return
+    logging.info(f"PAUSE requested - stopping cleanly at boundary: {where}")
+    logging.info(
+        "Paused. Re-run this module on the same project to resume "
+        "(already-extracted transects are skipped)."
+    )
+    sys.exit(PAUSE_EXIT_CODE)
+
 
 def extract_frames_ffmpeg(video_path, output_dir, frames_per_transect, video_name, start_number=1):
     """
@@ -792,6 +819,10 @@ def main():
     results = []
     transect_count = 0
     for transect_id, parts_data in grouped_videos.items():
+        # Pause boundary: the previous transect's frames are fully extracted and
+        # its tracking row updated. Stop here before starting the next transect.
+        checkpoint_pause(f"before transect {transect_id}")
+
         transect_count += 1
         # Sort parts by part number. Part 0 (single/base) comes before numbered parts.
         parts_data.sort(key=lambda x: x['part'])

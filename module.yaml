@@ -5,7 +5,9 @@
 # ==============================================================================
 
 name: "3D_phase1"
-version: "0.1.0"
+display_name: "3D phase 1"
+tags: ["3D"]
+version: "0.2.0"
 description: "Phase 1 of 3D photogrammetry pipeline: setup, frame extraction, and initial Metashape processing"
 author: "Lauren K Olinger"
 created: "2026-02-13"
@@ -19,7 +21,7 @@ inputs:
   - name: "video_files"
     type: "directory"
     formats: [".mov", ".mp4", ".mkv", ".avi"]
-    location: "raw/tcrmp_video/ or user-specified"
+    location: "<NAS path supplied at run time>"
     required: false
     description: "Directory containing video files for frame extraction (runs step0 + step1)"
 
@@ -34,55 +36,54 @@ inputs:
 # OUTPUTS
 # ------------------------------------------------------------------------------
 outputs:
-  - name: "psx_files"
-    type: "file"
-    format: ".psx"
-    location: "$PROJECT_DIR/processing/psxraw/"
-    naming_pattern: "psx_{N}_{PROJECT_NAME}.psx"
-    description: "Metashape project files with initial 3D models"
+  - dataset: "3D_phase1_psx_files"          # step1 Metashape projects (draft 3D models)
+    path_template: "${project_dir}/processing/psxraw/psx_{N}_{PROJECT_NAME}.psx"
+    eml: true
 
-  - name: "extracted_frames"
-    type: "directory"
-    format: ".tiff"
-    location: "$PROJECT_DIR/processing/frames/{MODEL_ID}/"
-    naming_pattern: "{MODEL_ID}_{NNNNN}.tiff"
-    description: "Extracted video frames (16-bit TIFF)"
+  - dataset: "3D_phase1_extracted_frames"   # 16-bit TIFF frames per model
+    path_template: "${project_dir}/processing/frames/{MODEL_ID}/"
+    eml: true
 
-  - name: "tracking_csv"
-    type: "file"
-    format: ".csv"
-    location: "$PROJECT_DIR/status_{PROJECT_NAME}.csv"
-    description: "Processing status tracking for all models"
+  - dataset: "3D_phase1_tracking_csv"       # per-project processing status table
+    path_template: "${project_dir}/status_{PROJECT_NAME}.csv"
+    eml: true
 
-  - name: "step1_reports"
-    type: "file"
-    format: ".pdf"
-    location: "$PROJECT_DIR/processing/reportsraw/"
-    naming_pattern: "{MODEL_ID}_step1.pdf"
-    description: "Metashape processing reports from step 1"
+  - dataset: "3D_phase1_step1_reports"      # Metashape step-1 PDF reports
+    path_template: "${project_dir}/processing/reportsraw/{MODEL_ID}_step1.pdf"
+    eml: true
 
 # ------------------------------------------------------------------------------
 # PARAMETERS
 # ------------------------------------------------------------------------------
+# The Phase-1-relevant subset of the shared analysis_params.yaml. Each carries
+# `analysis_path`: the dotted key the runner writes the form value into on
+# launch. For a brand-new project the file does not exist yet, so the runner
+# seeds it from this module's analysis_params.yaml template (full multi-phase
+# set) and overlays these Phase 1 values; run_phase1 then keeps that file.
+# See ui.params_writethrough below.
 parameters:
   - name: "frames_per_transect"
     type: "integer"
     default: 1000
+    analysis_path: "processing.frames_per_transect"
     description: "Number of frames to extract per video/transect"
 
   - name: "chunk_size"
     type: "integer"
     default: 1000
+    analysis_path: "processing.chunk_size"
     description: "Maximum frames per Metashape chunk"
 
   - name: "max_chunks_per_psx"
     type: "integer"
     default: 4
+    analysis_path: "processing.max_chunks_per_psx"
     description: "Maximum chunks per PSX file for batch processing"
 
   - name: "use_gpu"
     type: "boolean"
     default: true
+    analysis_path: "processing.use_gpu"
     description: "Enable GPU acceleration for Metashape processing"
 
 # ------------------------------------------------------------------------------
@@ -110,6 +111,56 @@ runtime:
 cli:
   main_script: "src/run_phase1.py"
   interactive: true
+  # Non-interactive flag mapping for the VICARIUS UI. When the form is
+  # submitted, the runner translates the named form fields into these CLI
+  # flags so the script never has to prompt — every input comes from the
+  # UI. The script's prompt-based fallback still works when run from a
+  # bare shell without these flags.
+  flag_map:
+    input_flag: "--input"
+    output_flag: "--project"
+    purpose_flag: "--purpose"
+    yes_flag: "--yes"
+    skip_vim_flag: "--skip-vim"
+
+# ------------------------------------------------------------------------------
+# UI FIELD LABELS
+# ------------------------------------------------------------------------------
+# Per-module overrides for the generic "Input directory" / "Output directory"
+# labels on the runner page. Because this module is interactive, the fields
+# are NOT piped into the script (the runner skips positional args for
+# interactive modules); they exist so the user knows which paths to have
+# ready when the script prompts for them in the stream console.
+ui:
+  # run_mode: terminal      -> only the "Run in terminal" launch is offered; the
+  #                            in-page SSE run button is hidden (multi-hour
+  #                            Metashape runs should not be tied to a browser tab).
+  # params_writethrough: true -> the curated `parameters:` fieldset is the single
+  #                            param surface (the full analysis_params tree is
+  #                            hidden); on launch the runner overlays those values
+  #                            into <project>/analysis_params.yaml (seeding the
+  #                            file from this module's template for a new project).
+  run_mode: "terminal"
+  params_writethrough: true
+  # Cooperative pause: step0/step1 poll a sentinel file at transect/model
+  # boundaries, so the runner page shows Pause/Resume. Pause finishes the current
+  # model, saves, and stops cleanly (frees the GPU + project lock); Resume
+  # re-launches and the idempotent steps continue. Also wired into /queue.
+  supports_pause: true
+  input_label: "Video or frame source directory"
+  input_help: |
+    Directory of source videos (.mov/.mp4/.mkv/.avi) OR a directory whose
+    subfolders each contain pre-extracted frames (.jpg/.tiff/...). The
+    runner auto-detects which flavor you gave it. This path is read-only;
+    videos are symlinked or copied into the project workspace below — the
+    source is never modified.
+  output_label: "Project workspace directory"
+  output_help: |
+    Will be created if it does not exist. This is the workspace that Phase
+    1 populates: video_source/, processing/frames/{MODEL_ID}/,
+    processing/psxraw/, processing/reportsraw/, .venv/, analysis_params.yaml,
+    status_{PROJECT_NAME}.csv. Phase 2 takes this same directory as its
+    input. Not an "output dir" in the usual sense — it is the project root.
 
 # ------------------------------------------------------------------------------
 # NAMING CONVENTIONS
